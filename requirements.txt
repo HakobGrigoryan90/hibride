@@ -4,7 +4,7 @@ uvicorn[standard]==0.32.1
 numpy==1.26.4
 joblib==1.4.2
 
-tensorflow-cpu==2.16.1
+tensorflow
 keras==3.5.0
 
 python-dateutil==2.9.0.post0
