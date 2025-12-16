@@ -1,23 +1,50 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+import os
+import math
+import logging
+from collections import deque
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
 import numpy as np
 import tensorflow as tf
 import keras
 from keras.saving import register_keras_serializable
 import joblib
-import os
-from collections import deque
-from datetime import datetime
-import math
 
-app = FastAPI(title="Multi-appliance NILM API", version="11.0")
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
+from transactions import Transaction  # from Luis' auth client
+
+# ========= Logging =========
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ========= FastAPI app =========
+app = FastAPI(
+    title="Multi-appliance NILM API with HIBRID-E Auth",
+    version="11.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app_start_time = datetime.now()
+
+# ========= Auth globals =========
+security = HTTPBearer()
+auth_manager: Optional[Transaction] = None
+
+# Credentials from environment (Render dashboard)
+HIBRIDE_EMAIL = os.getenv("HIBRIDE_EMAIL", "hakob.grigoryan@sensingcontrol.com")
+HIBRIDE_PASSWORD = os.getenv("HIBRIDE_PASSWORD", "AkOPsGreG90@")
+
+# ========= NILM model config =========
 MODEL_DIR = "models"
 MODEL_PATH = os.path.join(MODEL_DIR, "multi_appliance_nilm.h5")
 SCALERS_PATH = os.path.join(MODEL_DIR, "scalers_multi_appliance.pkl")
-SEQUENCE_LENGTH = 30
 
+SEQUENCE_LENGTH = 30
 FRIDGE_NAME = "Fridge-Freezer"
 ON_PROB_THRESHOLD = 0.5
 RECON_WEIGHT = 5.0  # must match training
@@ -27,24 +54,37 @@ class TimePoint(BaseModel):
     time: str
     aggregate: float
 
+
 class InferenceRequest(BaseModel):
     full_sequence: Optional[List[TimePoint]] = None
     single_point: Optional[TimePoint] = None
+
 
 class AppliancePrediction(BaseModel):
     appliance: str
     prediction: float
 
+
 class TimePointWithTargets(BaseModel):
     time: str
     aggregate: float
-    # per-appliance target powers, same order as `appliances`
-    appliance_powers: List[float]
+    appliance_powers: List[float]  # per-appliance targets, same order as `appliances`
+
 
 class FineTuneRequest(BaseModel):
     points: List[TimePointWithTargets]
     epochs: int = 3
     batch_size: int = 16
+
+
+class HealthCheck(BaseModel):
+    status: str
+    timestamp: datetime
+    version: str
+    uptime_seconds: float
+    auth_system_status: str
+    model_loaded: bool
+
 
 # ========= Feature definition =========
 FEATURE_COLS = [
@@ -56,6 +96,7 @@ FEATURE_COLS = [
     "sin_dow",
     "cos_dow",
 ]
+
 
 def compute_features(tp: TimePoint, prev_tp: Optional[TimePoint]) -> np.ndarray:
     dt = datetime.fromisoformat(tp.time)
@@ -87,16 +128,16 @@ def compute_features(tp: TimePoint, prev_tp: Optional[TimePoint]) -> np.ndarray:
         dtype=float,
     )
 
+
 # ========= Load model & scalers =========
 if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALERS_PATH):
-    raise RuntimeError("Model or scalers missing.")
+    raise RuntimeError("Model or scalers missing. Ensure files exist in /models.")
 
 @register_keras_serializable(package="nilm", name="sum_power_fn")
 def sum_power_fn(t):
     return tf.reduce_sum(t, axis=-1, keepdims=True)
 
 keras.config.enable_unsafe_deserialization()
-
 model = tf.keras.models.load_model(
     MODEL_PATH,
     compile=False,
@@ -109,7 +150,7 @@ target_scaler = scalers_info["target_scaler"]
 appliances = scalers_info["appliances"]
 on_thresholds_scaled = scalers_info["on_thresholds_scaled"]
 
-# === Reattach custom losses and total_loss_fn (for finetuning) ===
+# === Reattach custom losses for finetuning ===
 reg_loss = tf.keras.losses.Huber()
 cls_loss = tf.keras.losses.BinaryCrossentropy(from_logits=False)
 recon_loss = tf.keras.losses.MeanAbsoluteError()
@@ -117,11 +158,9 @@ recon_loss = tf.keras.losses.MeanAbsoluteError()
 def total_loss(y_true, y_pred):
     y_power_true, y_onoff_true, y_agg_true = y_true
     y_power_pred, y_onoff_pred, y_sum_pred = y_pred
-
     l_reg = reg_loss(y_power_true, y_power_pred)
     l_cls = cls_loss(y_onoff_true, y_onoff_pred)
     l_recon = recon_loss(y_agg_true, y_sum_pred)
-
     return l_reg + l_cls + RECON_WEIGHT * l_recon
 
 model.reg_loss_fn = reg_loss
@@ -133,19 +172,155 @@ model.total_loss_fn = total_loss
 buffer = deque(maxlen=SEQUENCE_LENGTH)
 prev_tp_global: Optional[TimePoint] = None
 
-# ========= Root =========
+
+# ========= Auth helpers =========
+def initialize_auth_system() -> bool:
+    global auth_manager
+    try:
+        logger.info("Inicializando sistema de autenticación de la API NILM...")
+        auth_manager = Transaction(HIBRIDE_EMAIL, HIBRIDE_PASSWORD)
+        success = auth_manager.login()
+        if success:
+            logger.info("✓ Autenticación interna inicializada correctamente")
+            auth_manager.start_auto_token_refresh()
+            logger.info("✓ Auto-refresh de tokens activado")
+            return True
+        else:
+            logger.error("✗ Fallo al inicializar el sistema de autenticación")
+            auth_manager = None
+            return False
+    except Exception as e:
+        logger.error(f"✗ Error crítico inicializando autenticación: {e}")
+        auth_manager = None
+        return False
+
+
+def get_auth_manager() -> Transaction:
+    if auth_manager is None or not auth_manager.is_authenticated():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Sistema de autenticación no disponible. Contacte al administrador.",
+        )
+    return auth_manager
+
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    token = credentials.credentials
+
+    if not token:
+        logger.warning("Token vacío proporcionado")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autorización requerido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if len(token) < 10:
+        logger.warning(f"Token demasiado corto: {len(token)} caracteres")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autorización inválido - longitud insuficiente",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        auth_mgr = get_auth_manager()
+    except HTTPException:
+        logger.error("Sistema de autenticación interno no disponible")
+        raise
+
+    if not auth_mgr.is_authenticated():
+        logger.error("Sistema de autenticación interno no está autenticado")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Servicio de autenticación temporalmente no disponible",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        logger.info(f"Validando token externo contra servidor: {token[:10]}...")
+        is_valid = auth_mgr.token_validation(token)
+        if not is_valid:
+            logger.warning(f"Token rechazado por el servidor: {token[:10]}...")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token no válido - rechazado por el servidor de autenticación",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        logger.info(f"Token validado exitosamente: {token[:10]}...")
+        return {
+            "token": token,
+            "validated_at": datetime.now().isoformat(),
+            "valid": True,
+            "validation_method": "server_validation",
+            "auth_system_status": "active",
+        }
+    except Exception as e:
+        logger.error(f"Error durante validación del token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Error en el servicio de validación de tokens",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ========= Startup hook =========
+@app.on_event("startup")
+async def startup_event():
+    ok = initialize_auth_system()
+    if not ok:
+        logger.error("No se pudo inicializar el sistema de autenticación")
+
+
+# ========= Root & health =========
 @app.get("/")
 def root():
     return {
-        "message": "NILM multi-appliance API",
+        "message": "NILM multi-appliance API with HIBRID-E auth",
         "sequence_length": SEQUENCE_LENGTH,
         "appliances": appliances,
+        "docs": "/docs",
+        "health": "/health",
+        "auth_info": "All NILM endpoints require Bearer token validated against HIBRID-E.",
     }
 
+
+@app.get("/health", response_model=HealthCheck)
+def health():
+    uptime = (datetime.now() - app_start_time).total_seconds()
+    try:
+        if auth_manager and auth_manager.is_authenticated():
+            auth_status = "authenticated"
+        elif auth_manager:
+            auth_status = "not_authenticated"
+        else:
+            auth_status = "not_initialized"
+    except Exception:
+        auth_status = "error"
+
+    model_loaded = model is not None
+
+    status_str = "healthy" if auth_status == "authenticated" and model_loaded else "degraded"
+
+    return HealthCheck(
+        status=status_str,
+        timestamp=datetime.now(),
+        version="11.0",
+        uptime_seconds=round(uptime, 2),
+        auth_system_status=auth_status,
+        model_loaded=model_loaded,
+    )
+
+
 # ========= Helper: build sequences for finetune =========
-def build_sequences_for_finetune(points: List[TimePointWithTargets],
-                                 seq_len: int,
-                                 num_appliances: int):
+def build_sequences_for_finetune(
+    points: List[TimePointWithTargets],
+    seq_len: int,
+    num_appliances: int,
+):
     if len(points) < seq_len:
         return None, None, None, None
 
@@ -159,23 +334,24 @@ def build_sequences_for_finetune(points: List[TimePointWithTargets],
         f = compute_features(tp_simple, prev_tp)
         feats_raw.append(f)
         prev_tp = tp_simple
-    feats_raw = np.array(feats_raw, dtype="float32")
 
+    feats_raw = np.array(feats_raw, dtype="float32")
     feats_scaled = feature_scaler.transform(feats_raw)
 
     full_targets = np.concatenate(
         [targets, aggs.reshape(-1, 1)],
-        axis=1
+        axis=1,
     )
     full_targets_scaled = target_scaler.transform(full_targets)
     y_power_scaled = full_targets_scaled[:, :num_appliances]
-    y_agg_scaled = full_targets_scaled[:, num_appliances:num_appliances+1]
+    y_agg_scaled = full_targets_scaled[:, num_appliances : num_appliances + 1]
 
     X_list, Y_power_list, Y_agg_list = [], [], []
+
     for i in range(len(points) - seq_len + 1):
-        X_list.append(feats_scaled[i:i+seq_len])
-        Y_power_list.append(y_power_scaled[i+seq_len-1])
-        Y_agg_list.append(y_agg_scaled[i+seq_len-1])
+        X_list.append(feats_scaled[i : i + seq_len])
+        Y_power_list.append(y_power_scaled[i + seq_len - 1])
+        Y_agg_list.append(y_agg_scaled[i + seq_len - 1])
 
     X_all = np.array(X_list, dtype="float32")
     Y_power_all = np.array(Y_power_list, dtype="float32")
@@ -191,9 +367,13 @@ def build_sequences_for_finetune(points: List[TimePointWithTargets],
 
     return X_all, Y_power_all, Y_onoff, Y_agg_all
 
-# ========= Predict endpoint =========
+
+# ========= Predict endpoint (protected) =========
 @app.post("/predict/", response_model=List[AppliancePrediction])
-def predict(data: InferenceRequest):
+def predict(
+    data: InferenceRequest,
+    token_data: Dict[str, Any] = Depends(verify_token),
+):
     global prev_tp_global
 
     if data.full_sequence is None and data.single_point is None:
@@ -231,12 +411,11 @@ def predict(data: InferenceRequest):
     # 3) Predict
     X = np.array(buffer).reshape(1, SEQUENCE_LENGTH, -1)
     power_scaled, onoff_prob, _ = model.predict(X, verbose=0)
-
     power_scaled = power_scaled[0]
     onoff_prob = onoff_prob[0]
 
     full_scaled_vector = np.zeros((1, len(appliances) + 1))
-    full_scaled_vector[0, :len(appliances)] = power_scaled
+    full_scaled_vector[0, : len(appliances)] = power_scaled
     full_inverse = target_scaler.inverse_transform(full_scaled_vector)[0]
 
     results: List[AppliancePrediction] = []
@@ -258,24 +437,34 @@ def predict(data: InferenceRequest):
         for r in results:
             r.prediction *= scale
 
+    logger.info(
+        f"/predict called, {len(results)} appliances, token: {token_data['token'][:10]}..."
+    )
+
     return results
 
-# ========= Finetune (transfer learning) endpoint =========
-@app.post("/finetune/")
-def finetune(req: FineTuneRequest):
-    num_appliances = len(appliances)
 
+# ========= Finetune endpoint (protected) =========
+@app.post("/finetune/")
+def finetune(
+    req: FineTuneRequest,
+    token_data: Dict[str, Any] = Depends(verify_token),
+):
+    num_appliances = len(appliances)
     X_all, Y_power, Y_onoff, Y_agg = build_sequences_for_finetune(
         req.points,
         SEQUENCE_LENGTH,
         num_appliances=num_appliances,
     )
+
     if X_all is None or X_all.shape[0] == 0:
         raise HTTPException(400, "Not enough points to build sequences for finetuning")
 
-    ds = tf.data.Dataset.from_tensor_slices(
-        (X_all, Y_power, Y_onoff, Y_agg)
-    ).shuffle(len(X_all)).batch(req.batch_size)
+    ds = (
+        tf.data.Dataset.from_tensor_slices((X_all, Y_power, Y_onoff, Y_agg))
+        .shuffle(len(X_all))
+        .batch(req.batch_size)
+    )
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
 
@@ -298,10 +487,17 @@ def finetune(req: FineTuneRequest):
             loss_b = finetune_step(x_b, y_p_b, y_c_b, y_a_b)
             epoch_loss += float(loss_b)
             n_batches += 1
-        print(f"[finetune] epoch {epoch+1}/{req.epochs}, "
-              f"loss={epoch_loss / max(n_batches,1):.6f}")
+        logger.info(
+            f"[finetune] epoch {epoch+1}/{req.epochs}, "
+            f"loss={epoch_loss / max(n_batches, 1):.6f}"
+        )
 
     model.save(MODEL_PATH)
+
+    logger.info(
+        f"/finetune completed, {int(X_all.shape[0])} sequences, "
+        f"token: {token_data['token'][:10]}..."
+    )
 
     return {
         "status": "ok",
