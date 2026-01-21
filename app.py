@@ -249,12 +249,12 @@ def predict_sequence_points(points: List[TimePoint]) -> List[PredictionFrame]:
 
     return frames
 
-# ========= Updated /predict endpoint with auto buffer fill =========
+# ========= Updated /predict endpoint =========
 @app.post("/predict/")
 def predict(req: InferenceRequest):
     global stream_buffer, stream_prev_tp
 
-    # Auto-fill buffer if full_sequence is provided
+    # If full_sequence provided, fill/update buffer
     if req.full_sequence:
         if len(req.full_sequence) < SEQUENCE_LENGTH:
             raise HTTPException(400, f"full_sequence must have at least {SEQUENCE_LENGTH} points")
@@ -266,19 +266,25 @@ def predict(req: InferenceRequest):
             prev_tp = tp
         stream_prev_tp = prev_tp
 
-    # If only single_point is provided, ensure buffer is initialized
+    # If single_point provided, append to buffer
     if req.single_point:
-        if stream_prev_tp is None:
-            raise HTTPException(400, "Buffer not initialized. Provide full_sequence first.")
+        if not stream_buffer or stream_prev_tp is None:
+            raise HTTPException(400, "Buffer not initialized. Provide a CSV or sequence first.")
         tp = req.single_point
         feats = compute_features(tp, stream_prev_tp)
         stream_buffer.append(feature_scaler.transform(feats.reshape(1, -1))[0])
         stream_prev_tp = tp
 
+    # If buffer exists, predict using last SEQUENCE_LENGTH points
     if not stream_buffer:
-        raise HTTPException(400, "No data in buffer to predict from.")
+        raise HTTPException(400, "Buffer not initialized. Provide a CSV or sequence first.")
 
-    agg_val = req.single_point.aggregate if req.single_point else req.full_sequence[-1].aggregate
+    agg_val = (
+        req.single_point.aggregate
+        if req.single_point
+        else stream_prev_tp.aggregate
+    )
+
     return predict_from_window(stream_buffer, agg_val)
 
 # ========= Updated /predict/sequence endpoint =========
