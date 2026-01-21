@@ -16,7 +16,6 @@ from collections import deque
 from datetime import datetime
 import math
 
-
 app = FastAPI(title="Multi-appliance NILM API", version="11.3")
 
 # ========= CORS =========
@@ -38,43 +37,35 @@ FRIDGE_NAME = "Fridge-Freezer"
 ON_PROB_THRESHOLD = 0.5
 RECON_WEIGHT = 5.0  # must match training
 
-
 # ========= Pydantic models =========
 class TimePoint(BaseModel):
     time: str
     aggregate: float
 
-
 class InferenceRequest(BaseModel):
     full_sequence: Optional[List[TimePoint]] = None
     single_point: Optional[TimePoint] = None
 
-
 class SequenceRequest(BaseModel):
     points: List[TimePoint]
-
 
 class AppliancePrediction(BaseModel):
     appliance: str
     prediction: float
 
-
 class PredictionFrame(BaseModel):
     time: str
     predictions: List[AppliancePrediction]
-
 
 class TimePointWithTargets(BaseModel):
     time: str
     aggregate: float
     appliance_powers: List[float]
 
-
 class FineTuneRequest(BaseModel):
     points: List[TimePointWithTargets]
     epochs: int = 3
     batch_size: int = 16
-
 
 # ========= Feature engineering =========
 def compute_features(tp: TimePoint, prev_tp: Optional[TimePoint]) -> np.ndarray:
@@ -106,7 +97,6 @@ def compute_features(tp: TimePoint, prev_tp: Optional[TimePoint]) -> np.ndarray:
         ],
         dtype="float32",
     )
-
 
 # ========= CSV parsing (NO pandas) =========
 def csv_to_timepoints(csv_content: bytes) -> List[TimePoint]:
@@ -160,16 +150,13 @@ def csv_to_timepoints(csv_content: bytes) -> List[TimePoint]:
 
     return tps
 
-
 # ========= Load model & scalers =========
 if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALERS_PATH):
     raise RuntimeError("Model or scalers missing")
 
-
 @register_keras_serializable(package="nilm", name="sum_power_fn")
 def sum_power_fn(t):
     return tf.reduce_sum(t, axis=-1, keepdims=True)
-
 
 keras.config.enable_unsafe_deserialization()
 
@@ -185,12 +172,10 @@ target_scaler = scalers_info["target_scaler"]
 appliances = scalers_info["appliances"]
 on_thresholds_scaled = scalers_info["on_thresholds_scaled"]
 
-
 # ========= Losses (for finetune) =========
 reg_loss = tf.keras.losses.Huber()
 cls_loss = tf.keras.losses.BinaryCrossentropy(from_logits=False)
 recon_loss = tf.keras.losses.MeanAbsoluteError()
-
 
 def total_loss(y_true, y_pred):
     y_power_true, y_onoff_true, y_agg_true = y_true
@@ -202,14 +187,11 @@ def total_loss(y_true, y_pred):
         + RECON_WEIGHT * recon_loss(y_agg_true, y_sum_pred)
     )
 
-
 model.total_loss_fn = total_loss
-
 
 # ========= Streaming state =========
 stream_buffer = deque(maxlen=SEQUENCE_LENGTH)
 stream_prev_tp: Optional[TimePoint] = None
-
 
 @app.get("/")
 def root() -> Dict[str, Any]:
@@ -218,7 +200,6 @@ def root() -> Dict[str, Any]:
         "sequence_length": SEQUENCE_LENGTH,
         "appliances": appliances,
     }
-
 
 # ========= Prediction helpers =========
 def predict_from_window(window: deque, agg_val: float) -> List[AppliancePrediction]:
@@ -248,7 +229,6 @@ def predict_from_window(window: deque, agg_val: float) -> List[AppliancePredicti
 
     return results
 
-
 def predict_sequence_points(points: List[TimePoint]) -> List[PredictionFrame]:
     if len(points) < SEQUENCE_LENGTH:
         raise HTTPException(400, "Not enough points")
@@ -269,15 +249,14 @@ def predict_sequence_points(points: List[TimePoint]) -> List[PredictionFrame]:
 
     return frames
 
-
 # ========= API endpoints =========
 @app.post("/predict/")
 def predict(req: InferenceRequest):
-    global stream_prev_tp
+    global stream_buffer, stream_prev_tp
 
     if req.full_sequence:
         if len(req.full_sequence) != SEQUENCE_LENGTH:
-            raise HTTPException(400, "full_sequence must be length 30")
+            raise HTTPException(400, f"full_sequence must be length {SEQUENCE_LENGTH}")
 
         stream_buffer.clear()
         prev = None
@@ -299,18 +278,46 @@ def predict(req: InferenceRequest):
     agg_val = req.single_point.aggregate if req.single_point else req.full_sequence[-1].aggregate
     return predict_from_window(stream_buffer, agg_val)
 
-
+# ========= Updated endpoints with auto buffer fill =========
 @app.post("/predict/sequence/")
 def predict_sequence(req: SequenceRequest):
-    return predict_sequence_points(req.points)
+    global stream_buffer, stream_prev_tp
 
+    points = req.points
+    if len(points) < SEQUENCE_LENGTH:
+        raise HTTPException(400, f"At least {SEQUENCE_LENGTH} points required")
+
+    # Auto-fill streaming buffer with last SEQUENCE_LENGTH points
+    stream_buffer.clear()
+    prev_tp = None
+    for tp in points[-SEQUENCE_LENGTH:]:
+        feats = compute_features(tp, prev_tp)
+        stream_buffer.append(feature_scaler.transform(feats.reshape(1, -1))[0])
+        prev_tp = tp
+    stream_prev_tp = prev_tp
+
+    return predict_sequence_points(points)
 
 @app.post("/predict/csv/sequence/")
 async def predict_csv_sequence(csv_file: UploadFile = File(...)):
+    global stream_buffer, stream_prev_tp
+
     content = await csv_file.read()
     points = csv_to_timepoints(content)
-    return predict_sequence_points(points)
 
+    if len(points) < SEQUENCE_LENGTH:
+        raise HTTPException(400, f"CSV must have at least {SEQUENCE_LENGTH} points")
+
+    # Auto-fill streaming buffer with last SEQUENCE_LENGTH points
+    stream_buffer.clear()
+    prev_tp = None
+    for tp in points[-SEQUENCE_LENGTH:]:
+        feats = compute_features(tp, prev_tp)
+        stream_buffer.append(feature_scaler.transform(feats.reshape(1, -1))[0])
+        prev_tp = tp
+    stream_prev_tp = prev_tp
+
+    return predict_sequence_points(points)
 
 # ========= Finetune =========
 @app.post("/finetune/")
