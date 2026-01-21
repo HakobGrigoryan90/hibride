@@ -249,36 +249,39 @@ def predict_sequence_points(points: List[TimePoint]) -> List[PredictionFrame]:
 
     return frames
 
-# ========= API endpoints =========
+# ========= Updated /predict endpoint with auto buffer fill =========
 @app.post("/predict/")
 def predict(req: InferenceRequest):
     global stream_buffer, stream_prev_tp
 
+    # Auto-fill buffer if full_sequence is provided
     if req.full_sequence:
-        if len(req.full_sequence) != SEQUENCE_LENGTH:
-            raise HTTPException(400, f"full_sequence must be length {SEQUENCE_LENGTH}")
-
+        if len(req.full_sequence) < SEQUENCE_LENGTH:
+            raise HTTPException(400, f"full_sequence must have at least {SEQUENCE_LENGTH} points")
         stream_buffer.clear()
-        prev = None
-        for tp in req.full_sequence:
-            feats = compute_features(tp, prev)
+        prev_tp = None
+        for tp in req.full_sequence[-SEQUENCE_LENGTH:]:
+            feats = compute_features(tp, prev_tp)
             stream_buffer.append(feature_scaler.transform(feats.reshape(1, -1))[0])
-            prev = tp
-        stream_prev_tp = prev
+            prev_tp = tp
+        stream_prev_tp = prev_tp
 
+    # If only single_point is provided, ensure buffer is initialized
     if req.single_point:
         if stream_prev_tp is None:
-            raise HTTPException(400, "Initialize with full_sequence first")
-
+            raise HTTPException(400, "Buffer not initialized. Provide full_sequence first.")
         tp = req.single_point
         feats = compute_features(tp, stream_prev_tp)
         stream_buffer.append(feature_scaler.transform(feats.reshape(1, -1))[0])
         stream_prev_tp = tp
 
+    if not stream_buffer:
+        raise HTTPException(400, "No data in buffer to predict from.")
+
     agg_val = req.single_point.aggregate if req.single_point else req.full_sequence[-1].aggregate
     return predict_from_window(stream_buffer, agg_val)
 
-# ========= Updated endpoints with auto buffer fill =========
+# ========= Updated /predict/sequence endpoint =========
 @app.post("/predict/sequence/")
 def predict_sequence(req: SequenceRequest):
     global stream_buffer, stream_prev_tp
@@ -287,7 +290,7 @@ def predict_sequence(req: SequenceRequest):
     if len(points) < SEQUENCE_LENGTH:
         raise HTTPException(400, f"At least {SEQUENCE_LENGTH} points required")
 
-    # Auto-fill streaming buffer with last SEQUENCE_LENGTH points
+    # Auto-fill streaming buffer
     stream_buffer.clear()
     prev_tp = None
     for tp in points[-SEQUENCE_LENGTH:]:
@@ -298,6 +301,7 @@ def predict_sequence(req: SequenceRequest):
 
     return predict_sequence_points(points)
 
+# ========= Updated /predict/csv/sequence endpoint =========
 @app.post("/predict/csv/sequence/")
 async def predict_csv_sequence(csv_file: UploadFile = File(...)):
     global stream_buffer, stream_prev_tp
@@ -308,7 +312,7 @@ async def predict_csv_sequence(csv_file: UploadFile = File(...)):
     if len(points) < SEQUENCE_LENGTH:
         raise HTTPException(400, f"CSV must have at least {SEQUENCE_LENGTH} points")
 
-    # Auto-fill streaming buffer with last SEQUENCE_LENGTH points
+    # Auto-fill streaming buffer
     stream_buffer.clear()
     prev_tp = None
     for tp in points[-SEQUENCE_LENGTH:]:
@@ -319,7 +323,7 @@ async def predict_csv_sequence(csv_file: UploadFile = File(...)):
 
     return predict_sequence_points(points)
 
-# ========= Finetune =========
+# ========= Finetune endpoint =========
 @app.post("/finetune/")
 def finetune(req: FineTuneRequest):
     num_appliances = len(appliances)
