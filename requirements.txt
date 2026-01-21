@@ -1,20 +1,17 @@
-pandas==2.2.2
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 
+numpy
 joblib==1.4.2
 scikit-learn==1.5.2
 
 tensorflow==2.20.0
+keras
 
 python-dateutil==2.9.0.post0
 
-# === added for auth + extras ===
 httpx
 pydantic
 python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
-numpy
-keras
-
